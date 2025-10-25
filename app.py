@@ -7,7 +7,7 @@ import os
 import re
 import numpy as np
 
-# 🔐 Secure API key (from Streamlit Secrets)
+# 🔐 Secure API key
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 
 # 🎨 Page Config
@@ -16,8 +16,7 @@ st.set_page_config(page_title="🧠 GenAI Excel Cleaner", layout="wide")
 # 🧩 Header
 st.title("🧠 GenAI Excel Cleaner")
 st.markdown(
-    "An **autonomous AI-powered assistant** that analyzes and cleans messy Excel files intelligently — "
-    "fixing duplicates, formatting, missing values, inconsistent types, and providing AI explanations per sheet."
+    "An **autonomous AI-powered data cleaning assistant** that analyzes, cleans, and explains changes in Excel files intelligently."
 )
 st.markdown(
     "<span style='font-size:14px;color:gray;'>Developed by <b>Group 3 – PwC Data & AI Mastery Program</b></span>",
@@ -29,13 +28,61 @@ st.divider()
 uploaded_file = st.file_uploader("📂 Upload your Excel file (.xlsx)", type=["xlsx"])
 
 
+# Helper: compute differences
+def get_change_log(original_df, cleaned_df):
+    """Generate a summary of what changed between original and cleaned DataFrames."""
+    changes = []
+
+    # Structural changes
+    row_diff = len(original_df) - len(cleaned_df)
+    if row_diff > 0:
+        changes.append(f"🗑️ Removed {row_diff} duplicate or empty row(s).")
+    elif row_diff < 0:
+        changes.append(f"⚠️ Added {abs(row_diff)} new row(s) (unexpected).")
+
+    # Column changes
+    orig_cols = set(original_df.columns)
+    clean_cols = set(cleaned_df.columns)
+    added_cols = clean_cols - orig_cols
+    removed_cols = orig_cols - clean_cols
+
+    if added_cols:
+        changes.append(f"➕ Added columns: {', '.join(added_cols)}")
+    if removed_cols:
+        changes.append(f"➖ Removed columns: {', '.join(removed_cols)}")
+
+    # Column name normalization
+    for col in original_df.columns:
+        normalized = re.sub(r"\s+", "_", col.strip().lower())
+        if col != normalized and normalized in cleaned_df.columns:
+            changes.append(f"🔤 Renamed '{col}' → '{normalized}'")
+
+    # Type changes
+    for col in cleaned_df.columns:
+        if col in original_df.columns:
+            orig_type = str(original_df[col].dtype)
+            clean_type = str(cleaned_df[col].dtype)
+            if orig_type != clean_type:
+                changes.append(f"🔢 Converted '{col}' type: {orig_type} → {clean_type}")
+
+    # Value cleaning checks
+    for col in cleaned_df.select_dtypes(include=["object"]).columns:
+        if col in original_df.columns:
+            before_nulls = original_df[col].isna().sum()
+            after_nulls = cleaned_df[col].isna().sum()
+            if after_nulls < before_nulls:
+                changes.append(f"✨ Filled missing values in '{col}' ({before_nulls - after_nulls} fixed).")
+            if any(cleaned_df[col].str.contains("Unknown", case=False, na=False)):
+                changes.append(f"❓ Replaced empty or invalid values with 'Unknown' in '{col}'.")
+    return changes
+
+
 def clean_and_infer_types(df):
-    """Automatic rule-based data cleaning + type inference"""
+    """Automatic rule-based data cleaning + type inference."""
     df = df.drop_duplicates().reset_index(drop=True)
     df = df.dropna(how="all")
     df.columns = [re.sub(r"\s+", "_", col.strip().lower()) for col in df.columns]
 
-    # Basic text cleaning for object columns
     for col in df.select_dtypes(include=["object"]).columns:
         df[col] = df[col].astype(str)
         df[col] = df[col].str.strip()
@@ -43,7 +90,7 @@ def clean_and_infer_types(df):
         df[col] = df[col].str.replace(r"[^\w\s\-./%]", "", regex=True)
         df[col] = df[col].replace(["Nan", "None", "Na", ""], np.nan)
 
-        # Try to detect and convert numbers (even with commas or symbols)
+        # Try to detect numeric with commas/symbols
         try:
             df[col] = (
                 df[col]
@@ -56,76 +103,61 @@ def clean_and_infer_types(df):
         except Exception:
             pass
 
-        # Try converting to dates
+        # Try converting to datetime
         try:
             df[col] = pd.to_datetime(df[col], errors="raise", infer_datetime_format=True)
             continue
         except Exception:
             pass
 
-        # Otherwise, standardize text casing
         df[col] = df[col].str.title()
 
     return df
 
 
 def ai_clean_dataframe(df, sheet_name, llm):
-    """AI-guided analysis + cleaning explanation"""
+    """AI-guided analysis + cleaning explanation + change log."""
     preview = df.head(5).to_string(index=False)
 
-    # 🧠 Ask AI to analyze and decide what to clean
+    # 🧠 Ask AI to analyze what needs cleaning
     analysis_template = PromptTemplate(
         input_variables=["sheet_name", "preview"],
         template="""
 You are a professional data cleaning assistant.
-Analyze the following data sample from the sheet '{sheet_name}':
+Analyze this sample from the Excel sheet '{sheet_name}':
 {preview}
 
-Identify issues such as:
-- Duplicates or blank rows
-- Extra spaces or inconsistent capitalization
-- Symbols or special characters
-- Mixed data types (e.g., numbers stored as text, dates stored as strings)
-- Missing values
-
-Then describe the main cleaning actions that should be performed.
-Respond in clear bullet points.
+Identify the main data quality problems and suggest how to clean them.
+List your suggestions as bullet points.
 """,
     )
-    ai_plan = llm.invoke(
-        analysis_template.format(sheet_name=sheet_name, preview=preview)
-    ).content
+    ai_plan = llm.invoke(analysis_template.format(sheet_name=sheet_name, preview=preview)).content
 
-    # Apply local cleaning & type inference
-    original_shape = df.shape
+    # Apply local cleaning & detect changes
+    original_df = df.copy()
     cleaned_df = clean_and_infer_types(df)
-    cleaned_shape = cleaned_df.shape
+    changes = get_change_log(original_df, cleaned_df)
 
-    # 🧠 Ask AI to summarize the improvements
+    # 🧠 Ask AI to summarize
     summary_template = PromptTemplate(
-        input_variables=["sheet_name", "ai_plan", "original_shape", "cleaned_shape"],
+        input_variables=["sheet_name", "ai_plan", "changes"],
         template="""
-You are summarizing data cleaning results for the sheet '{sheet_name}'.
+You are summarizing the data cleaning actions for the sheet '{sheet_name}'.
 
-AI identified and addressed the following issues:
+AI's cleaning plan:
 {ai_plan}
 
-Original shape: {original_shape} → Cleaned shape: {cleaned_shape}
+Detected changes during cleaning:
+{changes}
 
-Summarize the cleaning improvements in clear sentences.
-End with a single summary sentence about the data quality after cleaning.
+Summarize these improvements in a concise, professional way suitable for a data quality report.
 """,
     )
     ai_summary = llm.invoke(
-        summary_template.format(
-            sheet_name=sheet_name,
-            ai_plan=ai_plan,
-            original_shape=original_shape,
-            cleaned_shape=cleaned_shape,
-        )
+        summary_template.format(sheet_name=sheet_name, ai_plan=ai_plan, changes="\n".join(changes))
     ).content
 
-    return cleaned_df, ai_summary
+    return cleaned_df, ai_summary, changes
 
 
 if uploaded_file:
@@ -139,9 +171,15 @@ if uploaded_file:
 
         for sheet_name in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet_name)
-            cleaned_df, explanation = ai_clean_dataframe(df, sheet_name, llm)
+            cleaned_df, explanation, changes = ai_clean_dataframe(df, sheet_name, llm)
             cleaned_sheets[sheet_name] = cleaned_df
-            explanations.append(f"### 🧾 Sheet: {sheet_name}\n{explanation}\n")
+
+            st.markdown(f"### 🧾 Sheet: {sheet_name}")
+            st.markdown(f"**AI Explanation:**\n{explanation}")
+            st.markdown("**🔍 Detected Changes:**")
+            for change in changes:
+                st.markdown(f"- {change}")
+            st.divider()
 
         # 💾 Save Cleaned Excel
         output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
@@ -149,9 +187,7 @@ if uploaded_file:
             for s, d in cleaned_sheets.items():
                 d.to_excel(writer, sheet_name=s, index=False)
 
-        st.success("✅ AI Cleaning Completed!")
-        st.markdown("\n".join(explanations))
-
+        st.success("✅ AI Cleaning Completed! All detected changes have been listed above.")
         with open(output_path, "rb") as f:
             st.download_button(
                 label="⬇️ Download Cleaned Excel File",
