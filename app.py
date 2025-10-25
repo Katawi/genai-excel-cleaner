@@ -8,7 +8,7 @@ import tempfile
 import os
 
 # 🔑 OpenAI API Key (Ali's key)
-os.environ["OPENAI_API_KEY"] = "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"
+os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 
 # 🎨 Page Config
 st.set_page_config(page_title="🧠 GenAI Excel Cleaner", layout="wide")
@@ -73,3 +73,4 @@ if uploaded_file:
             )
 else:
     st.warning("Please upload an Excel file to begin.")
+
