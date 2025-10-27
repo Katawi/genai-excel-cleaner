@@ -102,4 +102,78 @@ if uploaded_file:
             df = pd.read_excel(xls, sheet_name=sheet)
             preview = df.head(10).to_csv(index=False)
 
-            # --- Step 1: Ask
+            # --- Step 1: Ask GPT what to do ---
+            # Use PromptTemplate.from_template() with safe placeholders
+            cleaning_template = PromptTemplate.from_template("""
+You are a data cleaning planner.
+You will receive a small CSV sample from an Excel sheet named: {sheet_name}
+Here is the sample:
+{sample_text}
+
+Your job:
+1. Identify all data quality issues.
+2. Output a JSON plan describing cleaning actions to apply.
+3. Each action must follow this schema:
+   {{"type": "action_name", "columns": [optional list], "value": [optional default]}}
+
+Valid actions:
+- remove_duplicates
+- drop_empty_rows
+- trim_whitespace
+- remove_special_chars
+- standardize_case
+- fill_missing
+- convert_to_numeric
+
+Output ONLY the JSON (no explanations, no markdown formatting).
+""")
+
+            # Format safely using sheet_name and sample_text
+            formatted_prompt = cleaning_template.format(
+                sheet_name=sheet,
+                sample_text=preview
+            )
+
+            plan_response = llm.invoke(formatted_prompt).content.strip()
+
+            # Clean up JSON from GPT output
+            plan_response = re.sub(r"```json|```", "", plan_response).strip()
+
+            try:
+                plan_json = json.loads(plan_response)
+                actions = plan_json.get("actions", [])
+            except Exception:
+                st.warning(f"⚠️ Could not parse AI plan for sheet '{sheet}'. Using defaults.")
+                actions = [{"type": "remove_duplicates"}, {"type": "trim_whitespace"}]
+
+            # --- Step 2: Apply actions in Python ---
+            cleaned_df, change_log = apply_cleaning_actions(df, actions)
+            cleaned_sheets[sheet] = cleaned_df
+
+            # --- Step 3: Display AI plan and change log ---
+            st.markdown(f"### 🧾 {sheet}")
+            st.markdown("**🤖 AI Cleaning Plan:**")
+            st.code(json.dumps(actions, indent=2), language="json")
+            st.markdown("**🔍 Changes Applied:**")
+            for c in change_log:
+                st.markdown(f"- {c}")
+            st.divider()
+            all_logs.append(f"### {sheet}\n" + "\n".join(change_log))
+
+        # --- Step 4: Save cleaned Excel ---
+        output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            for s, d in cleaned_sheets.items():
+                d.to_excel(writer, sheet_name=s, index=False)
+
+        st.success("✅ Cleaning completed and applied by AI.")
+        with open(output_path, "rb") as f:
+            st.download_button(
+                label="⬇️ Download Cleaned Excel File",
+                data=f,
+                file_name="cleaned_data_ai.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+else:
+    st.warning("Please upload an Excel file to begin.")
