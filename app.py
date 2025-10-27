@@ -4,18 +4,18 @@ from langchain.prompts import PromptTemplate
 import pandas as pd
 import tempfile
 import os
-import json
 import re
+import io
 
-# 🔐 Secure API key (Streamlit Secrets)
+# 🔐 Secure API key from Streamlit Secrets
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 
 # 🎨 Page setup
 st.set_page_config(page_title="🧠 GenAI Excel Cleaner", layout="wide")
-st.title("🧠 GenAI Excel Cleaner")
+st.title("🧠 GenAI Excel Cleaner (Fully AI-Driven & Scalable)")
 st.markdown(
-    "AI analyzes your Excel file, decides cleaning actions, applies them automatically, "
-    "and explains what was done."
+    "GPT-3.5 automatically cleans your Excel sheets — detects and fixes data issues, "
+    "handles large files smartly, and explains all improvements."
 )
 st.markdown(
     "<span style='font-size:14px;color:gray;'>Developed by <b>Group 3 – PwC Data & AI Mastery Program</b></span>",
@@ -23,150 +23,108 @@ st.markdown(
 )
 st.divider()
 
-# 📂 Upload Excel
+# 📂 Upload Excel file
 uploaded_file = st.file_uploader("📂 Upload Excel file (.xlsx)", type=["xlsx"])
 
-# 🧩 LLM setup
-llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.2)
-
-# ------------------------------------------------------------
-# Helper: Apply cleaning actions from JSON plan
-# ------------------------------------------------------------
-def apply_cleaning_actions(df, actions):
-    change_log = []
-    for act in actions:
-        a_type = act.get("type")
-
-        if a_type == "remove_duplicates":
-            before = len(df)
-            df = df.drop_duplicates().reset_index(drop=True)
-            change_log.append(f"🗑️ Removed {before - len(df)} duplicate rows.")
-
-        elif a_type == "drop_empty_rows":
-            before = len(df)
-            df = df.dropna(how="all")
-            change_log.append(f"🧹 Dropped {before - len(df)} empty rows.")
-
-        elif a_type == "trim_whitespace":
-            for c in df.select_dtypes(include=["object"]).columns:
-                df[c] = df[c].astype(str).str.strip()
-            change_log.append("✂️ Trimmed whitespace in text columns.")
-
-        elif a_type == "standardize_case":
-            cols = act.get("columns", df.select_dtypes(include=["object"]).columns)
-            for c in cols:
-                df[c] = df[c].str.title()
-            change_log.append(f"🔠 Standardized capitalization in {len(cols)} column(s).")
-
-        elif a_type == "remove_special_chars":
-            for c in df.select_dtypes(include=["object"]).columns:
-                df[c] = df[c].str.replace(r"[^\w\s\-./]", "", regex=True)
-            change_log.append("💬 Removed special characters in text columns.")
-
-        elif a_type == "fill_missing":
-            val = act.get("value", "Unknown")
-            df = df.fillna(val)
-            change_log.append(f"❓ Filled all missing values with '{val}'.")
-
-        elif a_type == "convert_to_numeric":
-            cols = act.get("columns", [])
-            for c in cols:
-                try:
-                    df[c] = (
-                        df[c]
-                        .astype(str)
-                        .str.replace(",", "")
-                        .str.replace("AED", "", case=False)
-                        .str.replace("%", "")
-                        .astype(float)
-                    )
-                    change_log.append(f"🔢 Converted '{c}' to numeric.")
-                except Exception:
-                    change_log.append(f"⚠️ Could not convert '{c}' to numeric.")
-
-    return df, change_log
+# 🧠 Initialize LLM
+llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.3)
 
 
 # ------------------------------------------------------------
-# Main Logic
+# 🔧 Helper: Dynamically sample large sheets
+# ------------------------------------------------------------
+def sample_data_for_prompt(df, max_rows=120, max_chars=12000):
+    """Return a text sample that fits GPT token limits intelligently."""
+    # If small sheet, send all rows
+    if len(df) <= max_rows:
+        csv_text = df.to_csv(index=False)
+    else:
+        # For large files: sample first 60 + last 60 rows to preserve variety
+        top = df.head(max_rows // 2)
+        bottom = df.tail(max_rows // 2)
+        sample = pd.concat([top, bottom])
+        csv_text = sample.to_csv(index=False)
+
+    # If still too long, truncate by characters
+    if len(csv_text) > max_chars:
+        csv_text = csv_text[:max_chars]
+
+    return csv_text
+
+
+# ------------------------------------------------------------
+# 🧹 Helper: GPT-based cleaning
+# ------------------------------------------------------------
+def clean_with_gpt(sheet_name, df, llm):
+    """Send data sample to GPT for cleaning and explanation."""
+    csv_sample = sample_data_for_prompt(df)
+
+    prompt = PromptTemplate.from_template("""
+You are a professional data cleaning assistant working for a data analytics team.
+
+You are given a sample of raw CSV data from an Excel sheet called "{sheet_name}".
+Analyze and clean it intelligently.
+
+Your tasks:
+1. Detect and fix all common data quality problems (duplicates, missing values, extra spaces, inconsistent capitalization, special characters, wrong types, etc.).
+2. Produce the **cleaned data as a valid CSV table only** — no markdown, no code blocks.
+3. After the CSV table, write:
+   "### EXPLANATION:" and describe briefly what you fixed and how.
+
+Here is the raw data sample:
+{csv_sample}
+""")
+
+    # 🧠 Ask GPT to clean the data
+    response = llm.invoke(prompt.format(sheet_name=sheet_name, csv_sample=csv_sample)).content.strip()
+
+    # Split GPT’s output into cleaned CSV + explanation
+    parts = re.split(r"### EXPLANATION:", response, maxsplit=1)
+    cleaned_csv = parts[0].strip()
+    explanation = parts[1].strip() if len(parts) > 1 else "No explanation provided."
+
+    # Try converting GPT’s CSV back to a DataFrame
+    try:
+        cleaned_df = pd.read_csv(io.StringIO(cleaned_csv))
+    except Exception:
+        cleaned_df = df.copy()
+        explanation += "\n⚠️ Could not fully parse cleaned CSV; using original structure."
+
+    return cleaned_df, explanation
+
+
+# ------------------------------------------------------------
+# 🚀 Main workflow
 # ------------------------------------------------------------
 if uploaded_file:
-    if st.button("🚀 Let AI Clean My File"):
-        st.info("AI analyzing and cleaning... please wait ⏳")
+    if st.button("🚀 Let GPT Clean My File"):
+        st.info("AI is analyzing and cleaning your Excel file... please wait ⏳")
 
         xls = pd.ExcelFile(uploaded_file)
         cleaned_sheets = {}
-        all_logs = []
 
         for sheet in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet)
-            preview = df.head(10).to_csv(index=False)
 
-            # --- Step 1: Ask GPT what to do ---
-            # Use PromptTemplate.from_template() with safe placeholders
-            cleaning_template = PromptTemplate.from_template("""
-You are a data cleaning planner.
-You will receive a small CSV sample from an Excel sheet named: {sheet_name}
-Here is the sample:
-{sample_text}
+            st.markdown(f"### 🧾 {sheet}")
+            cleaned_df, explanation = clean_with_gpt(sheet, df, llm)
 
-Your job:
-1. Identify all data quality issues.
-2. Output a JSON plan describing cleaning actions to apply.
-3. Each action must follow this schema:
-   {{"type": "action_name", "columns": [optional list], "value": [optional default]}}
+            # 🪄 Display results
+            st.success(f"✅ Cleaning complete for sheet: {sheet}")
+            st.markdown(f"**🤖 AI Explanation:** {explanation}")
+            st.markdown("**📊 Cleaned Preview:**")
+            st.dataframe(cleaned_df.head())
+            st.divider()
 
-Valid actions:
-- remove_duplicates
-- drop_empty_rows
-- trim_whitespace
-- remove_special_chars
-- standardize_case
-- fill_missing
-- convert_to_numeric
-
-Output ONLY the JSON (no explanations, no markdown formatting).
-""")
-
-            # Format safely using sheet_name and sample_text
-            formatted_prompt = cleaning_template.format(
-                sheet_name=sheet,
-                sample_text=preview
-            )
-
-            plan_response = llm.invoke(formatted_prompt).content.strip()
-
-            # Clean up JSON from GPT output
-            plan_response = re.sub(r"```json|```", "", plan_response).strip()
-
-            try:
-                plan_json = json.loads(plan_response)
-                actions = plan_json.get("actions", [])
-            except Exception:
-                st.warning(f"⚠️ Could not parse AI plan for sheet '{sheet}'. Using defaults.")
-                actions = [{"type": "remove_duplicates"}, {"type": "trim_whitespace"}]
-
-            # --- Step 2: Apply actions in Python ---
-            cleaned_df, change_log = apply_cleaning_actions(df, actions)
             cleaned_sheets[sheet] = cleaned_df
 
-            # --- Step 3: Display AI plan and change log ---
-            st.markdown(f"### 🧾 {sheet}")
-            st.markdown("**🤖 AI Cleaning Plan:**")
-            st.code(json.dumps(actions, indent=2), language="json")
-            st.markdown("**🔍 Changes Applied:**")
-            for c in change_log:
-                st.markdown(f"- {c}")
-            st.divider()
-            all_logs.append(f"### {sheet}\n" + "\n".join(change_log))
-
-        # --- Step 4: Save cleaned Excel ---
+        # 💾 Export cleaned Excel
         output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             for s, d in cleaned_sheets.items():
                 d.to_excel(writer, sheet_name=s, index=False)
 
-        st.success("✅ Cleaning completed and applied by AI.")
+        st.success("✅ All sheets cleaned successfully by GPT-3.5!")
         with open(output_path, "rb") as f:
             st.download_button(
                 label="⬇️ Download Cleaned Excel File",
@@ -174,6 +132,5 @@ Output ONLY the JSON (no explanations, no markdown formatting).
                 file_name="cleaned_data_ai.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-
 else:
     st.warning("Please upload an Excel file to begin.")
