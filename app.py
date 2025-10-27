@@ -1,6 +1,5 @@
 import streamlit as st
 from langchain_openai import ChatOpenAI
-from langchain.prompts import PromptTemplate
 import pandas as pd
 import tempfile
 import os
@@ -39,6 +38,7 @@ def profile_dataframe(df):
         "datetime_cols": len(df.select_dtypes(include=["datetime64[ns]"]).columns),
     }
 
+
 def plot_before_after(before_stats, after_stats, sheet):
     """Draw before/after comparison charts."""
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -62,6 +62,7 @@ def plot_before_after(before_stats, after_stats, sheet):
 
     fig.suptitle(f"🧾 Sheet: {sheet}", fontsize=12)
     st.pyplot(fig)
+
 
 def apply_cleaning_actions(df, actions):
     """Apply cleaning steps based on GPT plan."""
@@ -115,11 +116,13 @@ def apply_cleaning_actions(df, actions):
                 except Exception:
                     change_log.append(f"⚠️ Could not convert '{c}' to numeric.")
     return df, change_log
-# ─────────────────────────────────────────────────────────────
 
+
+# ─────────────────────────────────────────────────────────────
 if uploaded_file:
     if st.button("🚀 Clean with AI"):
         st.info("AI analyzing and cleaning... please wait ⏳")
+
         xls = pd.ExcelFile(uploaded_file)
         cleaned_sheets = {}
         all_logs = []
@@ -129,10 +132,8 @@ if uploaded_file:
             preview = df.head(10).to_csv(index=False)
             before_stats = profile_dataframe(df)
 
-            # --- GPT decides cleaning plan ---
-            prompt = PromptTemplate(
-                input_variables=["sheet", "preview"],
-                template="""
+            # --- GPT decides cleaning plan (f-string fix) ---
+            prompt_text = f"""
 You are a data cleaning planner.
 You will receive a small CSV sample from the sheet '{sheet}':
 {preview}
@@ -140,8 +141,8 @@ You will receive a small CSV sample from the sheet '{sheet}':
 Your job:
 1. Identify data quality issues.
 2. Output a JSON plan describing cleaning actions to apply.
-3. Each action must follow:
-   {"type": "action_name", "columns": [optional], "value": [optional]}
+3. Each action must follow this format:
+   {{"type": "action_name", "columns": [optional], "value": [optional]}}
 
 Valid actions:
 - remove_duplicates
@@ -153,9 +154,8 @@ Valid actions:
 - convert_to_numeric
 
 Output ONLY the JSON (no explanations).
-""",
-            )
-            plan_text = llm.invoke(prompt.format(sheet=sheet, preview=preview)).content.strip()
+"""
+            plan_text = llm.invoke(prompt_text).content.strip()
             plan_text = re.sub(r"```json|```", "", plan_text).strip()
 
             try:
