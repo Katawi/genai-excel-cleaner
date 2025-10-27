@@ -4,19 +4,19 @@ from langchain.prompts import PromptTemplate
 import pandas as pd
 import tempfile
 import os
+import json
 import re
-import numpy as np
+import matplotlib.pyplot as plt
 
-# 🔐 Secure API key
+# 🔐 API key (from Streamlit Secrets)
 os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 
-# 🎨 Page Config
+# 🎨 Page setup
 st.set_page_config(page_title="🧠 GenAI Excel Cleaner", layout="wide")
-
-# 🧩 Header
 st.title("🧠 GenAI Excel Cleaner")
 st.markdown(
-    "An **autonomous AI-powered data cleaning assistant** that analyzes, cleans, and explains changes in Excel files intelligently."
+    "AI analyzes your Excel file, decides cleaning actions, executes them automatically, "
+    "and visualizes before-and-after data quality metrics."
 )
 st.markdown(
     "<span style='font-size:14px;color:gray;'>Developed by <b>Group 3 – PwC Data & AI Mastery Program</b></span>",
@@ -24,170 +24,165 @@ st.markdown(
 )
 st.divider()
 
-# 📂 Upload Excel File
 uploaded_file = st.file_uploader("📂 Upload your Excel file (.xlsx)", type=["xlsx"])
+llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.2)
 
+# ─────────────────────────────────────────────────────────────
+# 🧩 Helper functions
+def profile_dataframe(df):
+    """Return a summary dict of key metrics."""
+    return {
+        "rows": len(df),
+        "nulls": int(df.isna().sum().sum()),
+        "object_cols": len(df.select_dtypes(include=["object"]).columns),
+        "numeric_cols": len(df.select_dtypes(include=["number"]).columns),
+        "datetime_cols": len(df.select_dtypes(include=["datetime64[ns]"]).columns),
+    }
 
-# Helper: compute differences
-def get_change_log(original_df, cleaned_df):
-    """Generate a summary of what changed between original and cleaned DataFrames."""
-    changes = []
+def plot_before_after(before_stats, after_stats, sheet):
+    """Draw before/after comparison charts."""
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
-    # Structural changes
-    row_diff = len(original_df) - len(cleaned_df)
-    if row_diff > 0:
-        changes.append(f"🗑️ Removed {row_diff} duplicate or empty row(s).")
-    elif row_diff < 0:
-        changes.append(f"⚠️ Added {abs(row_diff)} new row(s) (unexpected).")
+    # Chart 1 – Rows & Nulls
+    axes[0].bar(["Rows", "Nulls"], [before_stats["rows"], before_stats["nulls"]], label="Before")
+    axes[0].bar(["Rows", "Nulls"], [after_stats["rows"], after_stats["nulls"]], label="After", alpha=0.7)
+    axes[0].set_title("Rows & Nulls")
+    axes[0].legend()
 
-    # Column changes
-    orig_cols = set(original_df.columns)
-    clean_cols = set(cleaned_df.columns)
-    added_cols = clean_cols - orig_cols
-    removed_cols = orig_cols - clean_cols
+    # Chart 2 – Column Types
+    labels = ["Text", "Numeric", "Datetime"]
+    axes[1].bar(labels,
+                [before_stats["object_cols"], before_stats["numeric_cols"], before_stats["datetime_cols"]],
+                label="Before")
+    axes[1].bar(labels,
+                [after_stats["object_cols"], after_stats["numeric_cols"], after_stats["datetime_cols"]],
+                label="After", alpha=0.7)
+    axes[1].set_title("Column Types")
+    axes[1].legend()
 
-    if added_cols:
-        changes.append(f"➕ Added columns: {', '.join(added_cols)}")
-    if removed_cols:
-        changes.append(f"➖ Removed columns: {', '.join(removed_cols)}")
+    fig.suptitle(f"🧾 Sheet: {sheet}", fontsize=12)
+    st.pyplot(fig)
 
-    # Column name normalization
-    for col in original_df.columns:
-        normalized = re.sub(r"\s+", "_", col.strip().lower())
-        if col != normalized and normalized in cleaned_df.columns:
-            changes.append(f"🔤 Renamed '{col}' → '{normalized}'")
+def apply_cleaning_actions(df, actions):
+    """Apply cleaning steps based on GPT plan."""
+    change_log = []
+    for act in actions:
+        a_type = act.get("type")
 
-    # Type changes
-    for col in cleaned_df.columns:
-        if col in original_df.columns:
-            orig_type = str(original_df[col].dtype)
-            clean_type = str(cleaned_df[col].dtype)
-            if orig_type != clean_type:
-                changes.append(f"🔢 Converted '{col}' type: {orig_type} → {clean_type}")
+        if a_type == "remove_duplicates":
+            before = len(df)
+            df = df.drop_duplicates().reset_index(drop=True)
+            change_log.append(f"🗑️ Removed {before - len(df)} duplicate rows.")
 
-    # Value cleaning checks
-    for col in cleaned_df.select_dtypes(include=["object"]).columns:
-        if col in original_df.columns:
-            before_nulls = original_df[col].isna().sum()
-            after_nulls = cleaned_df[col].isna().sum()
-            if after_nulls < before_nulls:
-                changes.append(f"✨ Filled missing values in '{col}' ({before_nulls - after_nulls} fixed).")
-            if any(cleaned_df[col].str.contains("Unknown", case=False, na=False)):
-                changes.append(f"❓ Replaced empty or invalid values with 'Unknown' in '{col}'.")
-    return changes
+        elif a_type == "drop_empty_rows":
+            before = len(df)
+            df = df.dropna(how="all")
+            change_log.append(f"🧹 Dropped {before - len(df)} empty rows.")
 
+        elif a_type == "trim_whitespace":
+            for c in df.select_dtypes(include=["object"]).columns:
+                df[c] = df[c].astype(str).str.strip()
+            change_log.append("✂️ Trimmed whitespace in text columns.")
 
-def clean_and_infer_types(df):
-    """Automatic rule-based data cleaning + type inference."""
-    df = df.drop_duplicates().reset_index(drop=True)
-    df = df.dropna(how="all")
-    df.columns = [re.sub(r"\s+", "_", col.strip().lower()) for col in df.columns]
+        elif a_type == "remove_special_chars":
+            for c in df.select_dtypes(include=["object"]).columns:
+                df[c] = df[c].str.replace(r"[^\w\s\-./]", "", regex=True)
+            change_log.append("💬 Removed special characters from text columns.")
 
-    for col in df.select_dtypes(include=["object"]).columns:
-        df[col] = df[col].astype(str)
-        df[col] = df[col].str.strip()
-        df[col] = df[col].str.replace(r"\s+", " ", regex=True)
-        df[col] = df[col].str.replace(r"[^\w\s\-./%]", "", regex=True)
-        df[col] = df[col].replace(["Nan", "None", "Na", ""], np.nan)
+        elif a_type == "standardize_case":
+            cols = act.get("columns", df.select_dtypes(include=["object"]).columns)
+            for c in cols:
+                df[c] = df[c].str.title()
+            change_log.append(f"🔠 Standardized capitalization in {len(cols)} column(s).")
 
-        # Try to detect numeric with commas/symbols
-        try:
-            df[col] = (
-                df[col]
-                .str.replace(",", "")
-                .str.replace("AED", "", case=False)
-                .str.replace("%", "")
-                .astype(float)
-            )
-            continue
-        except Exception:
-            pass
+        elif a_type == "fill_missing":
+            val = act.get("value", "Unknown")
+            df = df.fillna(val)
+            change_log.append(f"❓ Filled all missing values with '{val}'.")
 
-        # Try converting to datetime
-        try:
-            df[col] = pd.to_datetime(df[col], errors="raise", infer_datetime_format=True)
-            continue
-        except Exception:
-            pass
-
-        df[col] = df[col].str.title()
-
-    return df
-
-
-def ai_clean_dataframe(df, sheet_name, llm):
-    """AI-guided analysis + cleaning explanation + change log."""
-    preview = df.head(5).to_string(index=False)
-
-    # 🧠 Ask AI to analyze what needs cleaning
-    analysis_template = PromptTemplate(
-        input_variables=["sheet_name", "preview"],
-        template="""
-You are a professional data cleaning assistant.
-Analyze this sample from the Excel sheet '{sheet_name}':
-{preview}
-
-Identify the main data quality problems and suggest how to clean them.
-List your suggestions as bullet points.
-""",
-    )
-    ai_plan = llm.invoke(analysis_template.format(sheet_name=sheet_name, preview=preview)).content
-
-    # Apply local cleaning & detect changes
-    original_df = df.copy()
-    cleaned_df = clean_and_infer_types(df)
-    changes = get_change_log(original_df, cleaned_df)
-
-    # 🧠 Ask AI to summarize
-    summary_template = PromptTemplate(
-        input_variables=["sheet_name", "ai_plan", "changes"],
-        template="""
-You are summarizing the data cleaning actions for the sheet '{sheet_name}'.
-
-AI's cleaning plan:
-{ai_plan}
-
-Detected changes during cleaning:
-{changes}
-
-Summarize these improvements in a concise, professional way suitable for a data quality report.
-""",
-    )
-    ai_summary = llm.invoke(
-        summary_template.format(sheet_name=sheet_name, ai_plan=ai_plan, changes="\n".join(changes))
-    ).content
-
-    return cleaned_df, ai_summary, changes
-
+        elif a_type == "convert_to_numeric":
+            cols = act.get("columns", [])
+            for c in cols:
+                try:
+                    df[c] = (
+                        df[c].astype(str)
+                        .str.replace(",", "")
+                        .str.replace("AED", "", case=False)
+                        .str.replace("%", "")
+                        .astype(float)
+                    )
+                    change_log.append(f"🔢 Converted '{c}' to numeric.")
+                except Exception:
+                    change_log.append(f"⚠️ Could not convert '{c}' to numeric.")
+    return df, change_log
+# ─────────────────────────────────────────────────────────────
 
 if uploaded_file:
-    llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.3)
-
-    if st.button("🚀 Let AI Clean My File"):
-        st.info("AI is analyzing and cleaning your Excel file... Please wait ⏳")
-
+    if st.button("🚀 Clean with AI"):
+        st.info("AI analyzing and cleaning... please wait ⏳")
         xls = pd.ExcelFile(uploaded_file)
-        cleaned_sheets, explanations = {}, []
+        cleaned_sheets = {}
+        all_logs = []
 
-        for sheet_name in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet_name)
-            cleaned_df, explanation, changes = ai_clean_dataframe(df, sheet_name, llm)
-            cleaned_sheets[sheet_name] = cleaned_df
+        for sheet in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sheet)
+            preview = df.head(10).to_csv(index=False)
+            before_stats = profile_dataframe(df)
 
-            st.markdown(f"### 🧾 Sheet: {sheet_name}")
-            st.markdown(f"**AI Explanation:**\n{explanation}")
-            st.markdown("**🔍 Detected Changes:**")
-            for change in changes:
-                st.markdown(f"- {change}")
-            st.divider()
+            # --- GPT decides cleaning plan ---
+            prompt = PromptTemplate(
+                input_variables=["sheet", "preview"],
+                template="""
+You are a data cleaning planner.
+You will receive a small CSV sample from the sheet '{sheet}':
+{preview}
 
-        # 💾 Save Cleaned Excel
+Your job:
+1. Identify data quality issues.
+2. Output a JSON plan describing cleaning actions to apply.
+3. Each action must follow:
+   {"type": "action_name", "columns": [optional], "value": [optional]}
+
+Valid actions:
+- remove_duplicates
+- drop_empty_rows
+- trim_whitespace
+- remove_special_chars
+- standardize_case
+- fill_missing
+- convert_to_numeric
+
+Output ONLY the JSON (no explanations).
+""",
+            )
+            plan_text = llm.invoke(prompt.format(sheet=sheet, preview=preview)).content.strip()
+            plan_text = re.sub(r"```json|```", "", plan_text).strip()
+
+            try:
+                actions = json.loads(plan_text)["actions"]
+            except Exception:
+                st.error(f"⚠️ Could not parse AI plan for sheet '{sheet}'. Using defaults.")
+                actions = [{"type": "remove_duplicates"}, {"type": "trim_whitespace"}]
+
+            # --- Execute plan ---
+            cleaned_df, change_log = apply_cleaning_actions(df, actions)
+            after_stats = profile_dataframe(cleaned_df)
+
+            # --- Show visualization ---
+            plot_before_after(before_stats, after_stats, sheet)
+
+            cleaned_sheets[sheet] = cleaned_df
+            all_logs.append(f"### 🧾 {sheet}\n" + "\n".join(change_log))
+
+        # --- Save cleaned Excel ---
         output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx").name
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             for s, d in cleaned_sheets.items():
                 d.to_excel(writer, sheet_name=s, index=False)
 
-        st.success("✅ AI Cleaning Completed! All detected changes have been listed above.")
+        st.success("✅ Cleaning completed and visualized by AI.")
+        st.markdown("\n\n".join(all_logs))
+
         with open(output_path, "rb") as f:
             st.download_button(
                 label="⬇️ Download Cleaned Excel File",
