@@ -4,5 +4,4 @@ langchain-openai==0.1.3
 openai
 pandas
 openpyxl
-regex
-numpy
+matplotlib
